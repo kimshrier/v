@@ -768,41 +768,39 @@ pub mut:
 	interface_impl_indexes                map[string]&InterfaceImplIndex
 	interface_query_indexes_ready         bool
 
-	c_globals               map[string]Type
-	global_names            map[string]bool
-	shared_global_names     map[string]bool
-	const_types             map[string]Type
-	const_exprs             map[string]flat.NodeId
-	const_modules           map[string]string
-	const_files             map[string]string
-	const_suffixes          map[string]string // dot-suffix -> full const key (O(1) lookup; '' if ambiguous)
-	declaration_visibility  map[string]DeclarationVisibility
-	checked_const_names     map[string]bool
-	imports                 map[string]string // alias -> short module name
-	file_imports            map[string]string
-	file_selective_imports  map[string][]string
-	file_imports_by_file    map[string]&FileImportInfo
-	file_modules            map[string]string
-	translated_files        map[string]bool
-	has_globals_files       map[string]bool
-	deprecated_symbols      map[string]DeprecationInfo
-	file_scope              &Scope = unsafe { nil }
-	cur_scope               &Scope = unsafe { nil }
-	scope_pool              []&Scope
-	scope_pool_index        int
-	has_builtins            bool
-	cur_module              string
-	cur_file                string
-	unsafe_depth            int
-	lock_depth              int
-	comptime_static_depth   int
-	errors                  []TypeError
-	notices                 []TypeError
-	resolved_call_names     []&CachedName // node_id -> resolved function name
-	resolved_call_set       []bool
-	resolved_fn_value_names []&CachedName // node_id -> resolved function value name
-	resolved_fn_value_set   []bool
-	statement_nodes         []bool
+	c_globals              map[string]Type
+	global_names           map[string]bool
+	shared_global_names    map[string]bool
+	const_types            map[string]Type
+	const_exprs            map[string]flat.NodeId
+	const_modules          map[string]string
+	const_files            map[string]string
+	const_suffixes         map[string]string // dot-suffix -> full const key (O(1) lookup; '' if ambiguous)
+	declaration_visibility map[string]DeclarationVisibility
+	checked_const_names    map[string]bool
+	imports                map[string]string // alias -> short module name
+	file_imports           map[string]string
+	file_selective_imports map[string][]string
+	file_imports_by_file   map[string]&FileImportInfo
+	file_modules           map[string]string
+	translated_files       map[string]bool
+	has_globals_files      map[string]bool
+	deprecated_symbols     map[string]DeprecationInfo
+	file_scope             &Scope = unsafe { nil }
+	cur_scope              &Scope = unsafe { nil }
+	scope_pool             []&Scope
+	scope_pool_index       int
+	has_builtins           bool
+	cur_module             string
+	cur_file               string
+	unsafe_depth           int
+	lock_depth             int
+	comptime_static_depth  int
+	errors                 []TypeError
+	notices                []TypeError
+	resolved_call_names    []&CachedName // node_id -> resolved function name
+	resolved_call_set      []bool
+	statement_nodes        []bool
 	// Exact call/function-value dependencies recorded while each function is
 	// checked. Consumers such as markused can walk these resolved Symbol-like
 	// names instead of reconstructing import and receiver resolution from syntax.
@@ -846,7 +844,8 @@ pub mut:
 	check_range_lo                int = -1
 	check_range_hi                int = -1
 	sparse_resolved_call_names    map[int]string
-	sparse_resolved_fn_values     map[int]string
+	sparse_resolved_fn_values     map[int]string // the only fn-value name store: a few dozen entries, a node-indexed array cost ~12 MB
+	fork_fn_value_writes          map[int]string // a transform fork's own fn-value writes ('' = cleared); its sparse map stays a read-only snapshot and only these are merged
 	sparse_statement_nodes        map[int]bool
 	sparse_expr_type_values       map[int]Type
 	sparse_checking_nodes         map[int]bool
@@ -1100,8 +1099,6 @@ pub fn TypeChecker.new(a &flat.FlatAst) TypeChecker {
 		// used without a collect() call.
 		resolved_call_names: []&CachedName{}
 		resolved_call_set: []bool{}
-		resolved_fn_value_names: []&CachedName{}
-		resolved_fn_value_set: []bool{}
 		statement_nodes: []bool{}
 		method_values_by_fn: map[int][]string{}
 		method_value_locals: map[string]bool{}
@@ -1267,8 +1264,6 @@ fn (tc &TypeChecker) fork_program_view(ast &flat.FlatAst, direct_dependencies_by
 		notices: []TypeError{}
 		resolved_call_names: tc.resolved_call_names
 		resolved_call_set: tc.resolved_call_set
-		resolved_fn_value_names: tc.resolved_fn_value_names
-		resolved_fn_value_set: tc.resolved_fn_value_set
 		statement_nodes: tc.statement_nodes
 		direct_dependencies_by_fn: direct_dependencies_by_fn
 		method_values_by_fn: tc.method_values_by_fn
@@ -1356,11 +1351,14 @@ pub fn (tc &TypeChecker) fork_for_parallel_codegen() &TypeChecker {
 	// maps just like the node-indexed semantic arrays in fork_program_view.
 	unsafe {
 		forked.sparse_resolved_call_names = tc.sparse_resolved_call_names
-		forked.sparse_resolved_fn_values = tc.sparse_resolved_fn_values
 		forked.sparse_statement_nodes = tc.sparse_statement_nodes
 		forked.sparse_expr_type_values = tc.sparse_expr_type_values
 		forked.sparse_checking_nodes = tc.sparse_checking_nodes
 	}
+	// Fn-value names are the one sparse store the master may still write to
+	// while cgen workers read (a type query on the declaration task can record
+	// a resolution), so each worker reads a private snapshot of its few entries.
+	forked.sparse_resolved_fn_values = tc.fn_value_snapshot()
 	forked.visible_mutation_cache = unsafe { nil }
 	forked.inherit_ownership_codegen_metadata_from(tc)
 	forked.set_fresh_type_cache_based_on(tc, tc.type_cache_parse_enabled())
@@ -1440,6 +1438,14 @@ pub fn (tc &TypeChecker) fork_for_parallel_transform(ast &flat.FlatAst) &TypeChe
 	forked.fork_overlay = &TransformForkOverlay{
 		base_node_count: if os.getenv('V3_NO_OVERLAY_RANGE') == '' { ast.nodes.len } else { -1 }
 	}
+	// Source-node fn-value resolutions live only in the sparse map. The fork
+	// reads a private snapshot of the parent's effective entries; its own
+	// writes and tombstones go to fork_fn_value_writes (see
+	// set_resolved_fn_value / clear_resolved_fn_value), which
+	// Transformer.merge_worker / absorb_scoped_batch replay into the parent
+	// through apply_forked_fn_value.
+	forked.sparse_resolved_fn_values = tc.fn_value_snapshot()
+	forked.fork_fn_value_writes = map[int]string{}
 	// Transform helpers allocate inside disposable arenas. A shared interner
 	// would let one helper publish map/array storage owned by its arena and leave
 	// other helpers with dangling storage when that arena is released. Each
@@ -1703,9 +1709,20 @@ pub fn (mut tc TypeChecker) free_parallel_transform_caches() {
 
 // reset_node_caches updates reset node caches state for types.
 fn (mut tc TypeChecker) reset_node_caches(n int) {
-	for group in 0 .. 3 {
+	tc.reset_sparse_fn_values()
+	for group in 0 .. 2 {
 		tc.reset_node_cache_group(n, group)
 	}
+}
+
+// reset_sparse_fn_values drops the resolved function-value names of a
+// previous AST. The dense cache this map replaced was recreated by every
+// node-cache reset; without this, a checker collected again would resolve
+// recycled node ids to stale targets. Called on the collecting thread before
+// both the serial and the parallel cache initialization.
+fn (mut tc TypeChecker) reset_sparse_fn_values() {
+	tc.sparse_resolved_fn_values.clear()
+	tc.fork_fn_value_writes.clear()
 }
 
 // Independent arrays can be initialized on separate persistent worker arenas.
@@ -1713,11 +1730,6 @@ fn (mut tc TypeChecker) reset_node_cache_group(n int, group int) {
 	if group == 0 {
 		tc.resolved_call_names = new_zeroed_name_cache(n)
 		tc.resolved_call_set = []bool{len: n}
-		return
-	}
-	if group == 1 {
-		tc.resolved_fn_value_names = new_zeroed_name_cache(n)
-		tc.resolved_fn_value_set = []bool{len: n}
 		return
 	}
 	tc.statement_nodes = []bool{len: n}
@@ -2094,8 +2106,8 @@ fn (mut tc TypeChecker) build_fn_declaration_indexes(a &flat.FlatAst) {
 		if qname !in tc.declaration_param_mutability {
 			tc.declaration_param_mutability[qname] = param_mutability
 		}
-		if node.value.contains('.') || node.is_static_type_method {
-			is_static := node.is_static_type_method || node.children_count == 0
+		if node.value.contains('.') || node.is_static_type_method() {
+			is_static := node.is_static_type_method() || node.children_count == 0
 				|| a.child_node(&node, 0).kind != .param || a.child_node(&node, 0).op != .dot
 			if node.value !in tc.static_associated_fn_keys {
 				tc.static_associated_fn_keys[node.value] = is_static
@@ -2194,14 +2206,12 @@ fn (mut tc TypeChecker) extend_node_caches(n int) {
 	if tc.parallel_check_sparse {
 		return
 	}
-	if n <= tc.resolved_call_names.len && n <= tc.resolved_fn_value_names.len
-		&& n <= tc.statement_nodes.len && n <= tc.expr_type_values.len && n <= tc.checking_nodes.len {
+	if n <= tc.resolved_call_names.len && n <= tc.statement_nodes.len
+		&& n <= tc.expr_type_values.len && n <= tc.checking_nodes.len {
 		return
 	}
 	extend_name_cache(mut tc.resolved_call_names, n)
 	extend_bool_cache(mut tc.resolved_call_set, n)
-	extend_name_cache(mut tc.resolved_fn_value_names, n)
-	extend_bool_cache(mut tc.resolved_fn_value_set, n)
 	extend_bool_cache(mut tc.statement_nodes, n)
 	extend_type_cache(mut tc.expr_type_values, n)
 	extend_bool_cache(mut tc.expr_type_set, n)
@@ -2213,8 +2223,6 @@ fn (mut tc TypeChecker) extend_node_caches(n int) {
 pub fn (mut tc TypeChecker) reserve_transform_node_caches(n int) {
 	reserve_name_cache(mut tc.resolved_call_names, n)
 	reserve_bool_cache(mut tc.resolved_call_set, n)
-	reserve_name_cache(mut tc.resolved_fn_value_names, n)
-	reserve_bool_cache(mut tc.resolved_fn_value_set, n)
 	reserve_bool_cache(mut tc.statement_nodes, n)
 	reserve_type_cache(mut tc.expr_type_values, n)
 	reserve_bool_cache(mut tc.expr_type_set, n)
@@ -2240,12 +2248,6 @@ pub fn (mut tc TypeChecker) materialize_sparse_transform_node_caches(n int, capa
 			tc.resolved_call_set[idx] = true
 		}
 	}
-	for idx, name in tc.sparse_resolved_fn_values {
-		if idx >= 0 && idx < n {
-			tc.resolved_fn_value_names[idx] = cached_name(name)
-			tc.resolved_fn_value_set[idx] = true
-		}
-	}
 	for idx, is_statement in tc.sparse_statement_nodes {
 		if is_statement && idx >= 0 && idx < n {
 			tc.statement_nodes[idx] = true
@@ -2258,7 +2260,6 @@ pub fn (mut tc TypeChecker) materialize_sparse_transform_node_caches(n int, capa
 		}
 	}
 	tc.sparse_resolved_call_names = map[int]string{}
-	tc.sparse_resolved_fn_values = map[int]string{}
 	tc.sparse_statement_nodes = map[int]bool{}
 	tc.sparse_expr_type_values = map[int]Type{}
 	tc.sparse_checking_nodes = map[int]bool{}
@@ -6943,7 +6944,7 @@ pub fn (mut tc TypeChecker) diagnose_unused_private_declarations(used_fns map[st
 		if node.kind == .fn_decl {
 			if node.op == .arrow || node.value in ['main', 'init', 'cleanup']
 				|| is_v_test_fn_name(node.value) || node.value.starts_with('__anon_fn_')
-				|| node.value.contains('.') || node.is_static_type_method {
+				|| node.value.contains('.') || node.is_static_type_method() {
 				continue
 			}
 			if tc.declaration_contains_error(node) {
@@ -8423,23 +8424,39 @@ pub fn (tc &TypeChecker) resolved_fn_value_name(id flat.NodeId) ?string {
 			return name
 		}
 	}
-	if tc.parallel_check_sparse {
-		if tc.in_check_range(idx) {
-			if idx < tc.resolved_fn_value_set.len && tc.resolved_fn_value_set[idx] {
-				return tc.resolved_fn_value_names[idx].value
+	if idx < 0 {
+		return none
+	}
+	if !isnil(tc.fork_overlay) {
+		if name := tc.fork_fn_value_writes[idx] {
+			if name.len == 0 {
+				// The fork cleared this entry (see clear_resolved_fn_value).
+				return none
 			}
-			return none
+			return name
 		}
-		return tc.sparse_resolved_fn_values[idx] or { none }
 	}
-	if idx >= 0 && idx < tc.resolved_fn_value_set.len && tc.resolved_fn_value_set[idx] {
-		return tc.resolved_fn_value_names[idx].value
+	return tc.sparse_resolved_fn_values[idx] or { none }
+}
+
+// set_resolved_fn_value records the resolved function-value target of a node.
+// A transform fork keeps the write private (its snapshot of the parent stays
+// read-only) until the merge replays it.
+pub fn (mut tc TypeChecker) set_resolved_fn_value(idx int, name string) {
+	if idx < 0 {
+		return
 	}
-	return none
+	if !isnil(tc.fork_overlay) {
+		tc.fork_fn_value_writes[idx] = name
+		return
+	}
+	tc.sparse_resolved_fn_values[idx] = name
 }
 
 // clear_resolved_fn_value removes stale function-value metadata after a later
-// transform proves that an identifier refers to a value declaration.
+// transform proves that an identifier refers to a value declaration. A
+// transform fork records a tombstone in its private writes instead, so the
+// snapshot entry stays hidden and the merge replays the clear.
 pub fn (mut tc TypeChecker) clear_resolved_fn_value(id flat.NodeId) {
 	idx := int(id)
 	if idx < 0 {
@@ -8447,14 +8464,58 @@ pub fn (mut tc TypeChecker) clear_resolved_fn_value(id flat.NodeId) {
 	}
 	if !isnil(tc.fork_overlay) {
 		tc.fork_overlay.resolved_fn_values.delete(idx)
-	}
-	if idx < tc.resolved_fn_value_set.len {
-		tc.resolved_fn_value_names[idx] = unsafe { nil }
-		tc.resolved_fn_value_set[idx] = false
+		// A tombstone is only meaningful when the parent snapshot actually has
+		// an entry to hide; otherwise drop any own write so the cleared range
+		// does not bloat the replayed write set with no-op tombstones.
+		if tc.sparse_resolved_fn_values[idx] or { '' } != '' {
+			tc.fork_fn_value_writes[idx] = ''
+		} else {
+			tc.fork_fn_value_writes.delete(idx)
+		}
+		return
 	}
 	if tc.sparse_resolved_fn_values.len > 0 {
 		tc.sparse_resolved_fn_values.delete(idx)
 	}
+}
+
+// fn_value_snapshot returns this checker's effective source-node fn-value
+// entries: the shared store, with a transform fork's own writes and
+// tombstones applied. New forks read from such a snapshot.
+pub fn (tc &TypeChecker) fn_value_snapshot() map[int]string {
+	mut snapshot := tc.sparse_resolved_fn_values.clone()
+	if !isnil(tc.fork_overlay) {
+		for idx, name in tc.fork_fn_value_writes {
+			if name.len == 0 {
+				snapshot.delete(idx)
+			} else {
+				snapshot[idx] = name
+			}
+		}
+	}
+	return snapshot
+}
+
+// fork_fn_value_replays_source reports whether a transform fork's private
+// fn-value write at `idx` must be replayed into its parent on merge: only
+// source nodes below the overlay boundary keep their ids. Transform-created
+// nodes are published through the overlay under shifted ids; an unbounded
+// overlay keeps every write private.
+pub fn (tc &TypeChecker) fork_fn_value_replays_source(idx int) bool {
+	return !isnil(tc.fork_overlay) && tc.fork_overlay.base_node_count >= 0
+		&& idx < tc.fork_overlay.base_node_count
+}
+
+// apply_forked_fn_value replays one source-node fn-value write from a
+// transform fork: an empty name is a tombstone (the fork cleared the entry),
+// anything else replaces the entry. `name` must already be owned by an arena
+// that outlives this checker.
+pub fn (mut tc TypeChecker) apply_forked_fn_value(idx int, name string) {
+	if name.len == 0 {
+		tc.clear_resolved_fn_value(flat.NodeId(idx))
+		return
+	}
+	tc.set_resolved_fn_value(idx, tc.canonical_symbol(name))
 }
 
 // direct_dependency_ids returns the checker-resolved function dependency
@@ -8671,22 +8732,10 @@ fn (mut tc TypeChecker) remember_resolved_fn_value(id flat.NodeId, name string) 
 	}
 	symbol_id, canonical := tc.intern_symbol(name)
 	tc.record_direct_dependency(symbol_id)
-	if tc.parallel_check_sparse {
-		if tc.in_check_range(idx) && idx < tc.resolved_fn_value_names.len {
-			tc.resolved_fn_value_names[idx] = cached_name(canonical)
-			tc.resolved_fn_value_set[idx] = true
-			return
-		}
-		tc.sparse_resolved_fn_values[idx] = canonical
-		return
-	}
-	if idx >= tc.resolved_fn_value_names.len {
-		tc.extend_node_caches(tc.a.nodes.len)
-	}
-	if idx < tc.resolved_fn_value_names.len {
-		tc.resolved_fn_value_names[idx] = cached_name(canonical)
-		tc.resolved_fn_value_set[idx] = true
-	}
+	// Parallel check workers write their private map, which
+	// merge_worker_sparse_caches publishes into the master's; transform forks
+	// write their private write set (see set_resolved_fn_value).
+	tc.set_resolved_fn_value(idx, canonical)
 }
 
 fn (mut tc TypeChecker) remember_resolved_fn_value_chain(id flat.NodeId, name string) {
@@ -9486,12 +9535,12 @@ fn (mut tc TypeChecker) check_fn_declaration_name(id flat.NodeId, node flat.Node
 	tc.check_fn_if_attribute_return(id, node)
 	tc.check_imported_module_prefix(id, node.value, 'fn')
 	mut name := node.value.all_after_last('.')
-	if node.is_static_type_method {
+	if node.is_static_type_method() {
 		if _, method := flat.decode_static_type_method_name(node.value) {
 			name = method
 		}
 	}
-	if !node.value.contains('.') && !node.is_static_type_method
+	if !node.value.contains('.') && !node.is_static_type_method()
 		&& tc.cur_module in ['', 'main'] && is_builtin_type_name(name) {
 		tc.record_error_at(.duplicate_decl, 'top level declaration cannot shadow builtin type', id, tc.fn_declaration_diagnostic_pos(node))
 	}
@@ -9508,7 +9557,7 @@ fn (mut tc TypeChecker) check_fn_declaration_name(id flat.NodeId, node flat.Node
 	if name.len == 0 || (!name[0].is_letter() && name[0] != `_`) || snake_case_name_is_valid(name) {
 		return
 	}
-	tc.check_snake_case_name(id, name, if node.value.contains('.') || node.is_static_type_method {
+	tc.check_snake_case_name(id, name, if node.value.contains('.') || node.is_static_type_method() {
 		'method name'
 	} else {
 		'function name'
@@ -11178,8 +11227,8 @@ fn (mut tc TypeChecker) check_decl_type_strings(node_id flat.NodeId, node flat.N
 		&& (node.children_count > 0 || split_sum_variant_texts(node.typ).len > 1) {
 		tc.check_sum_type_decl(node_id, node)
 	}
-	if node.kind == .fn_decl && (node.value.contains('.') || node.is_static_type_method) {
-		is_marked_static := node.is_static_type_method
+	if node.kind == .fn_decl && (node.value.contains('.') || node.is_static_type_method()) {
+		is_marked_static := node.is_static_type_method()
 		receiver_name := if is_marked_static {
 			if receiver, _ := flat.decode_static_type_method_name(node.value) {
 				receiver.all_after_last('.')
